@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Agentic Housing Assistant</title>
+    <link rel="stylesheet" href="/static/style.css" />
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+</head>
+
+<body>
+    <div class="app">
+        <header class="app__header">
+            <div class="brand">🏠 Agentic Housing</div>
+            <div class="hint">green = Eligibility • blue = Listings • red = Area</div>
+        </header>
+
+        <main id="chat" class="chat" aria-live="polite"></main>
+
+        <footer class="composer">
+            <div class="composer__quick">
+                <button class="chip" data-text="/help">/help</button>
+                <button class="chip" data-text="/next">/next</button>
+                <button class="chip" data-text="/list">/list</button>
+                <button class="chip" data-text="/reset">/reset</button>
+            </div>
+            <div class="composer__bar">
+                <input id="msg" type="text"
+                    placeholder="Type a message… e.g. I earn 110k, debts 450/mo, savings 40k; budget 800k in Brunswick" />
+                <button id="send" title="Send">➤</button>
+            </div>
+        </footer>
+    </div>
+
+    <script src="/static/app.js"></script>
+</body>
+
+</html>

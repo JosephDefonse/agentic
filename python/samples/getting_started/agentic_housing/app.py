@@ -4,16 +4,19 @@ import secrets
 import importlib.util
 from dataclasses import asdict
 from typing import Dict, Any
+from collections import defaultdict
 
 from flask import Flask, render_template, request, jsonify, session as flask_session
 from semantic_kernel import Kernel
 from semantic_kernel.contents import ChatHistory
 from semantic_kernel.functions import KernelArguments
 
-import importlib.util, sys, os
+import logging
+import requests
+import sys
 
 # ---- Dynamic import of your existing SK script (works even with hyphen in filename)
-AGENT_FILE = os.environ.get("AGENT_FILE", "AgenticHousing-SemanticKernel.py")
+AGENT_FILE = os.environ.get("AGENT_FILE", "main.py")
 
 _spec = importlib.util.spec_from_file_location("agentic_core", AGENT_FILE)
 if _spec is None or _spec.loader is None:
@@ -37,11 +40,343 @@ build_prompt_config = agentic_core.build_prompt_config
 # ---- Flask app
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET", secrets.token_hex(16))
+logging.basicConfig(level=logging.INFO)
 
 # Store per-browser session state in-memory (OK for demo)
 _sessions: Dict[str, Dict[str, Any]] = {}
 
+# ---------------------------
+# DATAVERSE SETTINGS (hard-code here for now)
+# ---------------------------
+DYN_URL = "https://org88ea65ee.api.crm6.dynamics.com"
+DYN_API_VERSION = "9.2"
+WEBAPIURL = f"{DYN_URL}/api/data/v{DYN_API_VERSION}/"
 
+# Option A: paste a short-lived bearer (from Postman) to skip token flow (for quick tests)
+HARDCODE_BEARER = "1eyJ0eXAiOiJKV1QiLCJhbGciOiJSUzI1NiIsIng1dCI6IkpZaEFjVFBNWl9MWDZEQmxPV1E3SG4wTmVYRSIsImtpZCI6IkpZaEFjVFBNWl9MWDZEQmxPV1E3SG4wTmVYRSJ9.eyJhdWQiOiJodHRwczovL29yZzg4ZWE2NWVlLmFwaS5jcm02LmR5bmFtaWNzLmNvbSIsImlzcyI6Imh0dHBzOi8vc3RzLndpbmRvd3MubmV0LzJlOTQ4ZWFmLWI1MmQtNDY2Ni04ZGFhLWNiYjMwZjgwZWM1ZC8iLCJpYXQiOjE3NTU3NTU5MTgsIm5iZiI6MTc1NTc1NTkxOCwiZXhwIjoxNzU1NzU5ODY1LCJhY2N0IjowLCJhY3IiOiIxIiwiYWlvIjoiQVVRQXUvOFpBQUFBSUxncDJVT3lFcXBkeUJpVVNXYjlHaGRVM2FDUkQyKzFCUWFFRnJnT3owUHI1UEU1TjQ1bzc0V2pybWh3UWY1RUFzYWFCSC93alovdUJlVFhtVXJYZ2c9PSIsImFtciI6WyJwd2QiXSwiYXBwaWQiOiI1MWY4MTQ4OS0xMmVlLTRhOWUtYWFhZS1hMjU5MWY0NTk4N2QiLCJhcHBpZGFjciI6IjAiLCJmYW1pbHlfbmFtZSI6IkRlIEZvbnNla2EiLCJnaXZlbl9uYW1lIjoiU2hlYW4iLCJpZHR5cCI6InVzZXIiLCJpcGFkZHIiOiIyMDAxOjgwMDM6ZGMwYjplZDAwOmZjZDM6NWY5ODo4M2E1OmFmNDYiLCJsb2dpbl9oaW50IjoiTy5DaVJoT1RJMU5UWXpOUzB3TWpBeUxUUmtZbUl0WVdGa09TMDVNVGxsTVRkaFptWTFPRGNTSkRKbE9UUTRaV0ZtTFdJMU1tUXRORFkyTmkwNFpHRmhMV05pWWpNd1pqZ3daV00xWkJva2MyUmxabTl1YzJWcllVQmtaV3h2YVhSMFpYQXViMjV0YVdOeWIzTnZablF1WTI5dElEaz0iLCJuYW1lIjoiU2hlYW4gRGUgRm9uc2VrYSIsIm9pZCI6ImE5MjU1NjM1LTAyMDItNGRiYi1hYWQ5LTkxOWUxN2FmZjU4NyIsInB1aWQiOiIxMDAzMjAwNDZBMDI2QjE2IiwicmgiOiIxLkFXY0FyNDZVTGkyMVprYU5xc3V6RDREc1hRY0FBQUFBQUFBQXdBQUFBQUFBQUFBMEFjaG5BQS4iLCJzY3AiOiJ1c2VyX2ltcGVyc29uYXRpb24iLCJzaWQiOiIwMDdkNGUzOS1jNjEyLWNkNmItZDYxOS05ZGFiM2IyNTEyZDgiLCJzdWIiOiIyd0RxZ0dPYm1kemhwak5RX3ZMS2F2Q3ZVQVc0ckdHMTVuTW5hSkJDV3c4IiwidGVuYW50X3JlZ2lvbl9zY29wZSI6Ik9DIiwidGlkIjoiMmU5NDhlYWYtYjUyZC00NjY2LThkYWEtY2JiMzBmODBlYzVkIiwidW5pcXVlX25hbWUiOiJzZGVmb25zZWthQGRlbG9pdHRlcC5vbm1pY3Jvc29mdC5jb20iLCJ1cG4iOiJzZGVmb25zZWthQGRlbG9pdHRlcC5vbm1pY3Jvc29mdC5jb20iLCJ1dGkiOiJma04ySEd1QzUwdW5lMlN4Nlpwa0FBIiwidmVyIjoiMS4wIiwieG1zX2Z0ZCI6IklETVJCYTAtNF9RaTJjUF9FZDJXbWJDRVlDYXk5Z1RLelRueE9lSzhWdE1CWVhWemRISmhiR2xoWXkxa2MyMXoiLCJ4bXNfaWRyZWwiOiIxIDEyIn0.Iu6_2nAW2zCtb43xdwGG5p4pMkFwyWHYXPGK3Ph3-pXklvELs7cTH3KItDPSNqypK6_8-3pOvj8nVTJyzpM8Qi5-cf96O0d6e_5qeLQEIrOIhZbVkP64Qy33fIr8Xyd801bF0Vhl5rC44wix0GPxt8lWIFPdAYhmdENT4TXsVrUo-OhWMhyOEt8WS9jsMhwKTa3jgwnlVxZcrsLekh_X2sejjo-iPexn9L87eIJV-VpGvZ0bWqYSIYDkH7gptoyHNECsWxE1unVoqo7358m0tXNt9QDYPVhzwKraRtp38Rhnusdeqc5M38vYbhbmRlSEgPRhXRxccr3fRifrP1J3dA"
+BEARER = ""
+
+# Option B: proper client-credentials flow (recommended)
+TENANT_ID = "common"
+CLIENT_ID = "51f81489-12ee-4a9e-aaaa-a2591f4598ab"
+
+
+def _token_endpoint(tenant: str) -> str:
+    return f"https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token"
+
+
+def get_access_token() -> str:
+    if HARDCODE_BEARER:
+        app.logger.info("Using hard-coded bearer token for Dataverse.")
+        return HARDCODE_BEARER
+    if not (CLIENT_ID and TENANT_ID):
+        raise RuntimeError("CLIENT_ID/TENANT_ID not set for Dataverse token flow.")
+    token_url = _token_endpoint(TENANT_ID)
+    scope = f"{DYN_URL}/.default"
+    resp = requests.post(
+        token_url,
+        data={
+            "client_id": CLIENT_ID,
+            "scope": scope,
+            "grant_type": "client_credentials",
+        },
+        timeout=20,
+    )
+    resp.raise_for_status()
+    return resp.json()["access_token"]
+
+
+# ---- Raw Dataverse fetchers
+def dataverse_get_contacts(access_token: str, top: int = 5) -> dict:
+    url = f"{WEBAPIURL}contacts?$select=contactid,fullname,emailaddress1&$top={top}"
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Accept": "application/json",
+        "OData-MaxVersion": "4.0",
+        "OData-Version": "4.0",
+    }
+    r = requests.get(url, headers=headers, timeout=20)
+    r.raise_for_status()
+    return r.json()
+
+
+def dataverse_get_properties(access_token: str, top: int = 5) -> dict:
+    url = (
+        f"{WEBAPIURL}cr54b_properties"
+        f"?$select=cr54b_title,cr54b_price,cr54b_type,cr54b_city,cr54b_suburb,cr54b_state,"
+        f"cr54b_bed,cr54b_bath,cr54b_car,cr54b_propertyid&$top={top}"
+    )
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Accept": "application/json",
+        "OData-MaxVersion": "4.0",
+        "OData-Version": "4.0",
+    }
+    r = requests.get(url, headers=headers, timeout=20)
+    r.raise_for_status()
+    return r.json()
+
+
+def dataverse_get_ptv(access_token: str, top: int = 5) -> dict:
+    url = f"{WEBAPIURL}cr54b_ptvs?$select=cr54b_name,cr54b_suburb&$top={top}"
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Accept": "application/json",
+        "OData-MaxVersion": "4.0",
+        "OData-Version": "4.0",
+    }
+    r = requests.get(url, headers=headers, timeout=20)
+    r.raise_for_status()
+    return r.json()
+
+
+def dataverse_get_restaurants(access_token: str, top: int = 5) -> dict:
+    url = f"{WEBAPIURL}cr54b_restaurants?$select=cr54b_name,cr54b_suburb&$top={top}"
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Accept": "application/json",
+        "OData-MaxVersion": "4.0",
+        "OData-Version": "4.0",
+    }
+    r = requests.get(url, headers=headers, timeout=20)
+    r.raise_for_status()
+    return r.json()
+
+
+def dataverse_get_schools(access_token: str, top: int = 5) -> dict:
+    url = f"{WEBAPIURL}cr54b_schools?$select=cr54b_name,cr54b_suburb&$top={top}"
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Accept": "application/json",
+        "OData-MaxVersion": "4.0",
+        "OData-Version": "4.0",
+    }
+    r = requests.get(url, headers=headers, timeout=20)
+    r.raise_for_status()
+    return r.json()
+
+
+# ---------------------------
+# Mapper: Dataverse -> agentic_core.PROPERTIES / AREA_INFO
+# ---------------------------
+def _normalize_type(s: str) -> str:
+    t = (s or "").strip().lower()
+    if t == "unit":  # map unit → apartment for your regexes
+        return "apartment"
+    return t
+
+
+def _key_suburb(s: str) -> str:
+    # Normalize suburb key (trim + preserve original spelling from CE)
+    return (s or "").strip()
+
+
+def _map_properties(props_json: dict) -> list[dict]:
+    rows = []
+    for it in props_json.get("value", []):
+        rows.append(
+            {
+                "id": it.get("cr54b_propertyid")
+                or it.get("id")
+                or it.get("cr54b_title"),
+                "title": (it.get("cr54b_title") or "").strip(),
+                "price": it.get("cr54b_price") or 0,
+                "type": _normalize_type(it.get("cr54b_type") or ""),
+                "city": (it.get("cr54b_city") or "").strip(),
+                "suburb": _key_suburb(it.get("cr54b_suburb") or ""),
+                "state": (it.get("cr54b_state") or "").strip(),
+                "lat": None,  # CE schema sample doesn't include coords
+                "lon": None,
+                "bed": it.get("cr54b_bed"),
+                "bath": it.get("cr54b_bath"),
+                "car": it.get("cr54b_car"),
+            }
+        )
+    return rows
+
+
+def _map_area_info(
+    ptv_json: dict,
+    schools_json: dict,
+    restaurants_json: dict,
+    property_rows: list[dict],
+) -> dict:
+    area: dict[str, dict[str, list[str]]] = defaultdict(
+        lambda: {"schools": [], "ptv": [], "restaurants": []}
+    )
+
+    # seed keys from properties so AREA_INFO has entries for all suburbs with listings
+    for p in property_rows:
+        _ = area[_key_suburb(p.get("suburb") or "")]
+
+    for it in ptv_json.get("value", []):
+        suburb = _key_suburb(it.get("cr54b_suburb"))
+        name = (it.get("cr54b_name") or "").strip()
+        if suburb and name and name not in area[suburb]["ptv"]:
+            area[suburb]["ptv"].append(name)
+
+    for it in schools_json.get("value", []):
+        suburb = _key_suburb(it.get("cr54b_suburb"))
+        name = (it.get("cr54b_name") or "").strip()
+        if suburb and name and name not in area[suburb]["schools"]:
+            area[suburb]["schools"].append(name)
+
+    for it in restaurants_json.get("value", []):
+        suburb = _key_suburb(it.get("cr54b_suburb"))
+        name = (it.get("cr54b_name") or "").strip()
+        if suburb and name and name not in area[suburb]["restaurants"]:
+            area[suburb]["restaurants"].append(name)
+
+    # cast defaultdict to regular dict for cleanliness
+    return {k: v for k, v in area.items()}
+
+
+def refresh_dataverse_into_agent(top_props: int = 50, top_support: int = 100) -> dict:
+    """
+    Pull CE data and write into agentic_core.PROPERTIES and agentic_core.AREA_INFO.
+    Returns a small summary for logging/UI.
+    """
+    token = get_access_token()
+    props = dataverse_get_properties(token, top=top_props)
+    ptv = dataverse_get_ptv(token, top=top_support)
+    schools = dataverse_get_schools(token, top=top_support)
+    restaurants = dataverse_get_restaurants(token, top=top_support)
+
+    prop_rows = _map_properties(props)
+    area_info = _map_area_info(ptv, schools, restaurants, prop_rows)
+
+    # Swap into the agent module so current_listings/Area use live data
+    agentic_core.PROPERTIES = prop_rows
+    print("agentic_core.PROPERTIES")
+    print(agentic_core.PROPERTIES)
+    agentic_core.AREA_INFO = area_info
+    print("agentic_core.AREA_INFO")
+    print(agentic_core.AREA_INFO)
+
+    app.logger.info(
+        "Dataverse sync -> PROPERTIES=%d, AREA_INFO suburbs=%d",
+        len(prop_rows),
+        len(area_info),
+    )
+    return {
+        "properties": len(prop_rows),
+        "suburbs": len(area_info),
+    }
+
+
+# ---------------------------
+# Optional: endpoints
+# ---------------------------
+
+
+def _pick_bearer_from_request_or_default() -> str:
+    auth = request.headers.get("Authorization", "")
+    if auth.lower().startswith("bearer "):
+        return auth.split(" ", 1)[1].strip()
+    return get_access_token()
+
+
+@app.get("/api/dynamics/contacts")
+def api_dynamics_contacts():
+    try:
+        top = int(request.args.get("top", 5))
+    except ValueError:
+        top = 5
+    try:
+        token = _pick_bearer_from_request_or_default()
+        data = dataverse_get_contacts(token, top=top)
+        return jsonify(data)
+    except Exception as e:
+        app.logger.exception("contacts call failed")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.get("/api/dynamics/properties")
+def api_dynamics_properties():
+    try:
+        top = int(request.args.get("top", 5))
+    except ValueError:
+        top = 5
+    try:
+        token = _pick_bearer_from_request_or_default()
+        data = dataverse_get_properties(token, top=top)
+        return jsonify(data)
+    except Exception as e:
+        app.logger.exception("properties call failed")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.get("/api/dynamics/ptv")
+def api_dynamics_ptv():
+    try:
+        top = int(request.args.get("top", 5))
+    except ValueError:
+        top = 5
+    try:
+        token = _pick_bearer_from_request_or_default()
+        data = dataverse_get_ptv(token, top=top)
+        return jsonify(data)
+    except Exception as e:
+        app.logger.exception("ptv call failed")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.get("/api/dynamics/restaurants")
+def api_dynamics_restaurants():
+    try:
+        top = int(request.args.get("top", 5))
+    except ValueError:
+        top = 5
+    try:
+        token = _pick_bearer_from_request_or_default()
+        data = dataverse_get_restaurants(token, top=top)
+        return jsonify(data)
+    except Exception as e:
+        app.logger.exception("restaurants call failed")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.get("/api/dynamics/schools")
+def api_dynamics_schools():
+    try:
+        top = int(request.args.get("top", 5))
+    except ValueError:
+        top = 5
+    try:
+        token = _pick_bearer_from_request_or_default()
+        data = dataverse_get_schools(token, top=top)
+        return jsonify(data)
+    except Exception as e:
+        app.logger.exception("schools call failed")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.post("/api/dynamics/sync")
+def api_dynamics_sync():
+    """
+    Pull CE data, normalize, and push into agentic_core.{PROPERTIES, AREA_INFO}.
+    Optional query params: ?props=N&support=M
+    """
+    try:
+        props = int(request.args.get("props", 50))
+    except ValueError:
+        props = 50
+    try:
+        support = int(request.args.get("support", 100))
+    except ValueError:
+        support = 100
+
+    try:
+        summary = refresh_dataverse_into_agent(top_props=props, top_support=support)
+        return jsonify({"ok": True, "summary": summary})
+    except Exception as e:
+        app.logger.exception("Dataverse sync failed")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+# ---------------------------
+# Your SK web wrapper (unchanged)
+# ---------------------------
 class WebAgent:
     def __init__(self) -> None:
         cfg = Config()
@@ -93,7 +428,7 @@ class WebAgent:
                 None,
             )
             if listing:
-                facts["area_info"] = AREA_INFO.get(listing["suburb"], {})
+                facts["area_info"] = agentic_core.AREA_INFO.get(listing["suburb"], {})
         return facts
 
     def _handle_commands(self, text: str) -> str | None:
@@ -164,10 +499,8 @@ class WebAgent:
         }.get(self.sess.phase, "eligibility")
 
     async def send_async(self, text: str) -> Dict[str, Any]:
-        # Commands first
         cmd_reply = self._handle_commands(text)
         if cmd_reply is not None:
-            # still record in history for context
             self.chat.add_user_message(text)
             self.chat.add_assistant_message(cmd_reply)
             return {
@@ -177,7 +510,6 @@ class WebAgent:
                 "facts": self._build_facts(),
             }
 
-        # Update borrower from free text
         self.sess.borrower, updates = parse_message_into_borrower(
             text, self.sess.borrower
         )
@@ -186,11 +518,9 @@ class WebAgent:
 
         self._maybe_compute_eligibility()
 
-        # chat history
         self.chat.add_user_message(text)
         hist = self._history_str(self.chat)
 
-        # Build facts and call SK
         facts = self._build_facts()
         result = await self.kernel.invoke(
             self.agent_func,
@@ -204,7 +534,6 @@ class WebAgent:
         reply_text = str(result)
         self.chat.add_assistant_message(reply_text)
 
-        # Simple auto-advance: if user asked to see listings and eligible
         if (
             self.sess.phase == Phase.ELIG
             and any(k in text.lower() for k in ["listings", "houses", "show houses"])
@@ -232,6 +561,17 @@ def get_webagent() -> WebAgent:
 
 @app.route("/")
 def index():
+    # One-time CE → agent data sync on first page load (simple guard flag; no Flask hooks needed)
+    if not app.config.get("_DV_AGENT_SYNCED"):
+        try:
+            summary = refresh_dataverse_into_agent(top_props=50, top_support=100)
+            app.logger.info("Seeded agent data from CE on first load: %s", summary)
+        except Exception as e:
+            app.logger.warning(
+                "CE -> agent data seed failed (continuing with built-ins): %s", e
+            )
+        app.config["_DV_AGENT_SYNCED"] = True
+
     return render_template("index.html")
 
 
@@ -241,9 +581,7 @@ def api_message():
     user_text = (data or {}).get("message", "").strip()
     if not user_text:
         return jsonify({"error": "empty"}), 400
-
     agent = get_webagent()
-    # Run the async SK call synchronously for Flask
     payload = asyncio.run(agent.send_async(user_text))
     return jsonify(payload)
 

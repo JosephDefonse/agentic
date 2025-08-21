@@ -1,0 +1,43 @@
+{
+    "Clayton": {
+        "schools": ["Monash University", "Clayton North Primary"],
+        "ptv": ["Pakenham/Cranbourne lines", "Bus 703", "Bus 733"],
+        "restaurants": ["Korean BBQ Hub", "Mala House", "Lamyong Veg"]
+    },
+    "Glen Waverly": { "schools": [], "ptv": [], "restaurants": [] },
+    "Melbourne CBD": {
+        "schools": ["RMIT City", "UniMelb (nearby tram)"],
+        "ptv": ["City Loop", "Free Tram Zone"],
+        "restaurants": ["HuTong Dumplings", "Hardware Société", "Tipo 00"]
+    },
+    "Brunswick": {
+        "schools": ["Brunswick Secondary", "CERES Early Learning"],
+        "ptv": ["Upfield line", "Tram 1", "Tram 6"],
+        "restaurants": ["A1 Bakery", "Very Good Falafel", "Green Refectory"]
+    },
+    "Footscray": {
+        "schools": ["Footscray High", "Victoria Uni"],
+        "ptv": ["Werribee/Williamstown lines", "Tram 82"],
+        "restaurants": ["Pho Hung Vuong", "Up in Smoke", "Nhu Lan"]
+    },
+    "Bentleigh": {
+        "schools": ["Bentleigh West Primary", "McKinnon Secondary"],
+        "ptv": ["Frankston Line", "Bus 703"],
+        "restaurants": ["Bentleigh Social", "No. 12", "Gudang"]
+    },
+    "Dandenong": {
+        "schools": ["Dandenong High", "Chisholm TAFE"],
+        "ptv": ["Pakenham/Cranbourne lines", "Bus Interchange"],
+        "restaurants": ["Afghan Markow", "Punjab Curry House", "Bun Bun"]
+    },
+    "Northcote": {
+        "schools": ["Northcote High", "Santa Maria College"],
+        "ptv": ["Mernda Line", "Tram 86"],
+        "restaurants": ["Estelle", "Tahina", "Pizza Meine Liebe"]
+    },
+    "Glen Waverley": {
+        "schools": ["Glen Waverly Secondary", "Wesley College"],
+        "ptv": ["Glen Waverley line", "Bus 902 SmartBus"],
+        "restaurants": ["Secret Kitchen", "Glenny Kebabs", "ShanDong Mama Mini"]
+    }
+}

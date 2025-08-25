@@ -86,16 +86,18 @@ class Config:
 
 @dataclass
 class Borrower:
-    gross_annual_income: Optional[float] = None  # AUD
-    monthly_debts: Optional[float] = None  # AUD
-    monthly_expenses: Optional[float] = None  # AUD (living + other)
+    first_name: Optional[str] = None  # NEW
+    last_name: Optional[str] = None  # NEW
+    gross_annual_income: Optional[float] = None
+    monthly_debts: Optional[float] = None
+    monthly_expenses: Optional[float] = None
     dependents: int = 0
-    savings: Optional[float] = None  # deposit
+    savings: Optional[float] = None
     target_price: Optional[float] = None
     loan_term_years: int = 30
-    rate_assessment: float = 0.069  # 6.9% assessed
-    serviceability_buffer: float = 0.03  # +3% buffer baked into assessed rate
-    location_hint: Optional[str] = None  # e.g., "Melbourne", "Brunswick"
+    rate_assessment: float = 0.069
+    serviceability_buffer: float = 0.03
+    location_hint: Optional[str] = None
 
 
 @dataclass
@@ -117,6 +119,22 @@ AREA_INFO: Dict[str, Dict[str, List[str]]] = {}
 # ----------------------------
 # Deterministic Engines
 # ----------------------------
+
+
+def resolve_suburb_key(name: Optional[str]) -> Optional[str]:
+    t = (name or "").strip().lower()
+    if not t:
+        return None
+    aliases = {"glen waverley": "Glen Waverley"}
+    if t in aliases:
+        return aliases[t]
+    for k in {(r.get("suburb") or "").strip() for r in PROPERTIES}:
+        if k.lower() == t:
+            return k
+    for k in AREA_INFO.keys():
+        if k.lower() == t:
+            return k
+    return None
 
 
 def pmt(pr: float, n_months: int, rate_monthly: float) -> float:
@@ -196,20 +214,32 @@ def compute_eligibility(b: Borrower) -> EligibilityOutcome:
 
 def filter_properties(
     budget_max: Optional[float] = None,
-    city: Optional[str] = None,
+    city: Optional[str] = None,  # kept for signature compat, but ignored
     suburb: Optional[str] = None,
     ptype: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     rows = PROPERTIES
+
+    # coerce price → float in case CE returns strings/decimals
+    def _price(r):
+        try:
+            return float(r.get("price", 0) or 0)
+        except Exception:
+            return 0.0
+
     if budget_max is not None:
-        rows = [r for r in rows if r["price"] <= budget_max]
-    if city:
-        rows = [r for r in rows if r["city"].lower() == city.lower()]
+        rows = [r for r in rows if _price(r) <= float(budget_max)]
+
+    # ⬇️ Only filter by suburb and type
     if suburb:
-        rows = [r for r in rows if r["suburb"].lower() == suburb.lower()]
+        s = suburb.strip().lower()
+        rows = [r for r in rows if (r.get("suburb") or "").strip().lower() == s]
+
     if ptype:
-        rows = [r for r in rows if r["type"].lower() == ptype.lower()]
-    return sorted(rows, key=lambda r: r["price"])[:8]
+        t = ptype.strip().lower()
+        rows = [r for r in rows if (r.get("type") or "").strip().lower() == t]
+
+    return sorted(rows, key=lambda r: _price(r))[:8]
 
 
 # ----------------------------
@@ -217,6 +247,12 @@ def filter_properties(
 # ----------------------------
 
 _NUM = r"([0-9]+(?:\.[0-9]+)?)"
+
+NAME_FULL_PAT = re.compile(
+    r"(?i)\b(?:my name is|i am|i'm)\s+([A-Za-z][A-Za-z\-']+)\s+([A-Za-z][A-Za-z\-']+)\b"
+)
+FIRSTNAME_PAT = re.compile(r"(?i)\bfirst\s*name\s*[:=\s]*([A-Za-z][A-Za-z\-']+)\b")
+LASTNAME_PAT = re.compile(r"(?i)\blast\s*name\s*[:=\s]*([A-Za-z][A-Za-z\-']+)\b")
 
 INCOME_PAT = re.compile(rf"(?i)(?:earn|income|salary)\s*[:=\s]*\$?{_NUM}\s*(k|,?000)?")
 DEBT_PAT = re.compile(
@@ -228,8 +264,13 @@ DEPS_PAT = re.compile(rf"(?i)(?:dependents?|kids?)\s*[:=\s]*{_NUM}")
 EXP_PAT = re.compile(
     rf"(?i)(?:expenses|spend)\s*[:=\s]*\$?{_NUM}\s*/?\s*(mo|month|monthly)?"
 )
-TYPE_PAT = re.compile(r"(?i)\b(house|apartment|unit|townhouse)\b")
-SUBURB_PAT = re.compile(r"(?i)(?:in|at|around)\s+([A-Za-z\s]+)(?:,\s*VIC|\s*VIC)?\b")
+TYPE_PAT = re.compile(
+    r"(?i)\b(house|houses|apartment|apartments|unit|units|townhouse|townhouses)\b"
+)
+SUBURB_PAT = re.compile(
+    r"(?i)(?:in|at|around)\s+(?!income\b)([A-Za-z][A-Za-z\s\-']{1,40})(?:,\s*VIC|\s*VIC)?\b"
+)
+
 CITY_PAT = re.compile(r"(?i)\bMelbourne\b")
 
 
@@ -259,13 +300,28 @@ def parse_message_into_borrower(
         updates["target_price"] = k_to_number(m.group(1), m.group(2))
     if m := DEPS_PAT.search(msg):
         updates["dependents"] = int(float(m.group(1)))
+
     if m := TYPE_PAT.search(msg):
-        t = m.group(1).lower()
+        t = m.group(1).lower().rstrip("s")
         updates["preferred_type"] = "apartment" if t in ["apartment", "unit"] else t
+
     if CITY_PAT.search(msg):
         updates["location_hint"] = "Melbourne"
+
     if m := SUBURB_PAT.search(msg):
-        updates["location_hint"] = m.group(1).strip()
+        raw = m.group(1).strip()
+        canon = resolve_suburb_key(raw)
+        if canon:
+            updates["location_hint"] = canon
+
+    if m := NAME_FULL_PAT.search(msg):
+        updates["first_name"] = m.group(1).strip().title()
+        updates["last_name"] = m.group(2).strip().title()
+    else:
+        if m := FIRSTNAME_PAT.search(msg):
+            updates["first_name"] = m.group(1).strip().title()
+        if m := LASTNAME_PAT.search(msg):
+            updates["last_name"] = m.group(1).strip().title()
 
     for k, v in updates.items():
         if hasattr(b, k):
@@ -292,9 +348,9 @@ USER:
 {{$user_input}}
 
 GUIDELINES:
-- For Eligibility phase: ask only for missing critical fields (income, debts, expenses, dependents, savings, target price, location). When sufficient, briefly summarize capacity and offer "/next" to see listings.
+- For Eligibility phase: ask only for missing critical fields (first name, last name, income, debts, expenses, dependents, savings, target price, location). When sufficient, briefly summarize capacity and offer "/next" to see listings.
 - For Listings phase: **use ONLY the items provided in SYSTEM FACTS under `current_listings`. Never invent properties.** If `current_listings` is empty or missing, say "No matches in my dataset for the current filters" and suggest narrowing/widening filters (e.g., suburb, type, or budget). Present 3–5 options from `current_listings` as a numbered list with price, type, and suburb. Offer "/pick <#>" for area details.
-- For Area phase: show 4-6 bullet points across schools, PTV, and restaurants for the chosen suburb. Offer "/next" to finish or "/list" to go back to listings.
+- For Area phase: If the user asks for specific categories (e.g., only PTV or only restaurants), show **only** those categories present in `area_info` / `requested_categories`. Do not include categories they did not ask for. If none were specified, give a concise mix across schools, PTV, and restaurants. If a requested category has no data, say so briefly.
 - Always end with one clear next action the user can take (e.g., "/next", "/pick 2", or provide a missing field).
 
 REPLY:
@@ -541,13 +597,14 @@ def current_listings(sess: Session) -> List[Dict[str, Any]]:
     max_budget = sess.borrower.target_price or (
         sess.last_outcome.max_loan if sess.last_outcome else None
     )
-    city, suburb = (None, None)
+
+    suburb = None
     if sess.borrower.location_hint:
-        lh = sess.borrower.location_hint
-        suburb = lh if lh in AREA_INFO else None
-        city = "Melbourne"
+        suburb = resolve_suburb_key(sess.borrower.location_hint)
+
+    # ⬇️ city=None so it won't filter out CE rows with blank city
     return filter_properties(
-        max_budget, city=city, suburb=suburb, ptype=sess.preferred_type
+        max_budget, city=None, suburb=suburb, ptype=sess.preferred_type
     )
 
 

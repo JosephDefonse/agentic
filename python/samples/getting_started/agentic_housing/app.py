@@ -65,6 +65,17 @@ def _token_endpoint(tenant: str) -> str:
     return f"https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token"
 
 
+# --- helpers (put near the top of app.py) ---
+def _as_float(v):
+    if v is None:
+        return None
+    try:
+        # allow "150,000.00" or "150000" strings
+        return float(str(v).replace(",", ""))
+    except ValueError:
+        return None
+
+
 def get_access_token() -> str:
     if HARDCODE_BEARER:
         app.logger.info("Using hard-coded bearer token for Dataverse.")
@@ -84,6 +95,57 @@ def get_access_token() -> str:
     )
     resp.raise_for_status()
     return resp.json()["access_token"]
+
+
+def dataverse_create_contact(
+    access_token: str,
+    *,
+    firstname: str,
+    lastname: str,
+    cr54b_income: float,
+    cr54b_debts: float,
+    cr54b_expense: float,
+    cr54b_savings: float,
+    cr54b_target_price: float,
+    cr54b_suburb: str,
+) -> dict:
+    url = f"{WEBAPIURL}contacts"
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Accept": "application/json",
+        "Content-Type": "application/json; charset=utf-8",
+        "OData-MaxVersion": "4.0",
+        "OData-Version": "4.0",
+    }
+    payload = {
+        "firstname": firstname,
+        "lastname": lastname,
+        "cr54b_income": cr54b_income,
+        "cr54b_debts": cr54b_debts,
+        "cr54b_expenses": cr54b_expense,
+        "cr54b_savings": cr54b_savings,
+        "cr54b_target_price": cr54b_target_price,
+        "cr54b_suburb": cr54b_suburb,
+    }
+
+    r = requests.post(url, headers=headers, json=payload, timeout=20)
+    # Dataverse usually returns 204 with the new entity URL in OData-EntityId header
+    if r.status_code in (201, 204):
+        entity_url = r.headers.get("OData-EntityId") or r.headers.get("odata-entityid")
+        contact_id = None
+        if entity_url:
+            import re as _re
+
+            m = _re.search(r"\(([^)]+)\)", entity_url)
+            if m:
+                contact_id = m.group(1)
+        return {"ok": True, "id": contact_id, "entityUrl": entity_url}
+
+    try:
+        r.raise_for_status()
+    except Exception:
+        pass
+    return {"ok": False, "status": r.status_code, "text": r.text}
 
 
 # ---- Raw Dataverse fetchers
@@ -231,12 +293,14 @@ def _map_area_info(
     return {k: v for k, v in area.items()}
 
 
-def refresh_dataverse_into_agent(top_props: int = 50, top_support: int = 100) -> dict:
+def refresh_dataverse_into_agent(
+    top_props: int = 50, top_support: int = 100, access_token: str | None = None
+) -> dict:
     """
     Pull CE data and write into agentic_core.PROPERTIES and agentic_core.AREA_INFO.
     Returns a small summary for logging/UI.
     """
-    token = get_access_token()
+    token = access_token or get_access_token()
     props = dataverse_get_properties(token, top=top_props)
     ptv = dataverse_get_ptv(token, top=top_support)
     schools = dataverse_get_schools(token, top=top_support)
@@ -276,19 +340,56 @@ def _pick_bearer_from_request_or_default() -> str:
     return get_access_token()
 
 
-@app.get("/api/dynamics/contacts")
-def api_dynamics_contacts():
-    try:
-        top = int(request.args.get("top", 5))
-    except ValueError:
-        top = 5
+@app.post("/api/dynamics/contacts")
+def api_create_contact():
+    data = request.get_json(force=True) or {}
+
+    firstname = (data.get("firstname") or data.get("first_name") or "").strip()
+    lastname = (data.get("lastname") or data.get("last_name") or "").strip()
+    income = _as_float(data.get("cr54b_income"))
+    debts = _as_float(data.get("cr54b_debts"))
+    expenses = _as_float(data.get("cr54b_expenses") or data.get("cr54b_expense"))
+    savings = _as_float(data.get("cr54b_savings"))
+    target = _as_float(data.get("cr54b_target_price"))
+    suburb = (data.get("cr54b_suburb") or data.get("suburb") or "").strip()
+
+    # validate
+    if not firstname or not lastname:
+        return jsonify({"ok": False, "error": "firstname/lastname required"}), 400
+    for label, val in [
+        ("income", income),
+        ("debts", debts),
+        ("expenses", expenses),
+        ("savings", savings),
+        ("target price", target),
+    ]:
+        if val is None:
+            return jsonify({"ok": False, "error": f"{label} required"}), 400
+    if not suburb:
+        return jsonify({"ok": False, "error": "suburb required"}), 400
+
     try:
         token = _pick_bearer_from_request_or_default()
-        data = dataverse_get_contacts(token, top=top)
-        return jsonify(data)
+        result = dataverse_create_contact(
+            token,
+            firstname=firstname,
+            lastname=lastname,
+            cr54b_income=income,
+            cr54b_debts=debts,
+            cr54b_expense=expenses,
+            cr54b_savings=savings,
+            cr54b_target_price=target,
+            cr54b_suburb=suburb,
+        )
+        if not result.get("ok"):
+            return (
+                jsonify({"ok": False, "error": result.get("text", "Dataverse error")}),
+                502,
+            )
+        return jsonify(result)
     except Exception as e:
-        app.logger.exception("contacts call failed")
-        return jsonify({"error": str(e)}), 500
+        app.logger.exception("create contact failed")
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 @app.get("/api/dynamics/properties")
@@ -353,10 +454,6 @@ def api_dynamics_schools():
 
 @app.post("/api/dynamics/sync")
 def api_dynamics_sync():
-    """
-    Pull CE data, normalize, and push into agentic_core.{PROPERTIES, AREA_INFO}.
-    Optional query params: ?props=N&support=M
-    """
     try:
         props = int(request.args.get("props", 50))
     except ValueError:
@@ -367,7 +464,11 @@ def api_dynamics_sync():
         support = 100
 
     try:
-        summary = refresh_dataverse_into_agent(top_props=props, top_support=support)
+        # ⬇️ use the Authorization header if present
+        token = _pick_bearer_from_request_or_default()
+        summary = refresh_dataverse_into_agent(
+            top_props=props, top_support=support, access_token=token
+        )
         return jsonify({"ok": True, "summary": summary})
     except Exception as e:
         app.logger.exception("Dataverse sync failed")
@@ -445,7 +546,7 @@ class WebAgent:
         if t == "/next":
             if self.sess.phase == Phase.ELIG:
                 self.sess.phase = Phase.LIST
-                return "Moving to listings."
+                return "Moving to Listings Agent. Ask me anything about the houses in Melbourne!"
             elif self.sess.phase == Phase.LIST:
                 if self.sess.picked_listing is not None:
                     self.sess.phase = Phase.AREA
@@ -465,7 +566,7 @@ class WebAgent:
                 if 1 <= idx <= len(rows):
                     self.sess.picked_listing = rows[idx - 1]["id"]
                     self.sess.phase = Phase.AREA
-                    return f"Selected listing #{idx}."
+                    return f"Selected listing #{idx}. Chat to me about PTV, Restaurants or Schools in the area!"
                 return "Invalid pick index."
             return "Usage: /pick <#>"
         return None
@@ -584,6 +685,80 @@ def api_message():
     agent = get_webagent()
     payload = asyncio.run(agent.send_async(user_text))
     return jsonify(payload)
+
+
+# --- helpers
+def _num(x, field):
+    if x is None or x == "":
+        raise ValueError(f"{field} required")
+    try:
+        return float(x)
+    except Exception:
+        raise ValueError(f"{field} must be a number")
+
+
+def _int(x, field):
+    v = _num(x, field)
+    return int(round(v))
+
+
+@app.post("/api/session/seed")
+def api_session_seed():
+    """
+    Accepts a full borrower profile from the form and stores it in the current session.
+    Required JSON body:
+      first_name, last_name, location_hint (suburb),
+      target_price, gross_annual_income, monthly_debts, monthly_expenses, savings, dependents
+    """
+    data = request.get_json(force=True) or {}
+    try:
+        agent = get_webagent()
+        b = agent.sess.borrower
+
+        # strings
+        b.first_name = (data.get("first_name") or "").strip()
+        b.last_name = (data.get("last_name") or "").strip()
+        b.location_hint = (data.get("location_hint") or "").strip()
+
+        # numbers
+        b.target_price = _num(data.get("target_price"), "target_price")
+        b.gross_annual_income = _num(
+            data.get("gross_annual_income"), "gross_annual_income"
+        )
+        b.monthly_debts = _num(data.get("monthly_debts"), "monthly_debts")
+        b.monthly_expenses = _num(data.get("monthly_expenses"), "monthly_expenses")
+        b.savings = _num(data.get("savings"), "savings")
+        b.dependents = _int(data.get("dependents"), "dependents")
+
+        # compute eligibility now that we have everything
+        agent._maybe_compute_eligibility()
+
+        return jsonify(
+            {
+                "ok": True,
+                "phase": agent.sess.phase,
+                "phaseClass": agent._phase_color(),
+                "facts": agent._build_facts(),
+            }
+        )
+    except Exception as e:
+        app.logger.exception("seed session failed")
+        return jsonify({"ok": False, "error": str(e)}), 400
+
+
+@app.get("/api/debug/datasets")
+def api_debug_datasets():
+    import agentic_core as ac
+
+    return jsonify(
+        {
+            "properties_count": len(ac.PROPERTIES),
+            "sample_suburbs": sorted(
+                {(r.get("suburb") or "").strip() for r in ac.PROPERTIES}
+            )[:10],
+            "area_info_keys": list(ac.AREA_INFO.keys())[:10],
+        }
+    )
 
 
 if __name__ == "__main__":

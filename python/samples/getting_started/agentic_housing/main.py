@@ -151,56 +151,73 @@ def pmt(pr: float, n_months: int, rate_monthly: float) -> float:
 def compute_eligibility(b: Borrower) -> EligibilityOutcome:
     notes: List[str] = []
 
-    # Defaults for missing items
-    income = (b.gross_annual_income or 0.0) / 12.0
-    debts = b.monthly_debts or 0.0
-    expenses = b.monthly_expenses if b.monthly_expenses is not None else 2500.0
+    # 1) Normalize inputs (monthly basis)
+    monthly_income = float(b.gross_annual_income or 0.0) / 12.0
+    debts = float(b.monthly_debts or 0.0)
+    expenses = float(b.monthly_expenses if b.monthly_expenses is not None else 2500.0)
+    dependents = max(int(b.dependents or 0), 0)
 
-    # Simple synthetic rule-of-thumb for max repayment: 30% of gross monthly income - debts - dependent buffer
-    dependent_buffer = 300.0 * max(b.dependents, 0)
-    max_monthly_repay = max(
-        0.0, 0.30 * income - debts - dependent_buffer - 0.10 * expenses
+    # 2) Repayment capacity (conservative but reasonable)
+    #    - DSR cap: at most 35% of gross monthly income
+    #    - Surplus cap: income - expenses - debts - dependent buffer
+    dependent_buffer = 300.0 * dependents
+    dsr_cap = 0.35 * monthly_income
+    surplus_cap = monthly_income - expenses - debts - dependent_buffer
+    max_monthly_repay = max(0.0, min(dsr_cap, surplus_cap))
+
+    # Add helpful sanity notes (doesn't change the math)
+    if expenses > monthly_income * 0.8:
+        notes.append(
+            "Monthly expenses are very high relative to income—double-check the amount."
+        )
+    if debts > monthly_income * 0.5:
+        notes.append(
+            "Monthly debts are high relative to income—capacity reduced by synthetic rules."
+        )
+
+    # 3) Convert repayment capacity -> principal capacity at assessed/stress rate
+    assessed_rate = float(b.rate_assessment or 0.0) + float(
+        b.serviceability_buffer or 0.0
     )
+    r = assessed_rate / 12.0  # monthly rate
+    n = int((b.loan_term_years or 30) * 12)
 
-    assessed_rate = (
-        b.rate_assessment + b.serviceability_buffer
-    )  # e.g., 9.9% if 6.9% + 3%
-    r = assessed_rate / 12.0
-    n = b.loan_term_years * 12
+    if max_monthly_repay <= 0 or n <= 0:
+        max_loan = 0.0
+    else:
+        if r <= 0:
+            # Zero/invalid rate fallback: simple linear sum
+            max_loan = max_monthly_repay * n
+        else:
+            # PV of an annuity: PV = PMT * (1 - (1+r)^-n) / r
+            annuity_factor = (1.0 - (1.0 + r) ** (-n)) / r
+            max_loan = max_monthly_repay * annuity_factor
 
-    # Invert PMT to get principal capacity: binary search
-    def capacity_from_payment(pmt_target: float) -> float:
-        lo, hi = 0.0, 2_000_000.0
-        for _ in range(60):
-            mid = (lo + hi) / 2
-            m = pmt(mid, n, r)
-            if m > pmt_target:
-                hi = mid
-            else:
-                lo = mid
-        return lo
-
-    max_loan = capacity_from_payment(max_monthly_repay)
-
+    # 4) LVR/LMI & eligibility vs target
     lvr = None
     requires_lmi = False
-    eligible = max_loan > 0
+    eligible = max_loan > 0.0
 
     if b.target_price and b.savings is not None:
-        deposit = b.savings
-        needed_loan = max(0.0, b.target_price - deposit)
-        if b.target_price > 0:
-            lvr = needed_loan / b.target_price
+        target_price = float(b.target_price)
+        deposit = float(b.savings)
+        needed_loan = max(0.0, target_price - deposit)
+
+        if target_price > 0:
+            lvr = needed_loan / target_price
             if lvr > 0.90:
                 requires_lmi = True
                 notes.append("Deposit below 10% (LVR > 90%). Synthetic rule flags LMI.")
+
         if needed_loan > max_loan:
             eligible = False
             notes.append("Target price exceeds synthetic borrowing capacity.")
 
+    # 5) No surplus → not eligible
     if max_monthly_repay <= 0:
         eligible = False
-        notes.append("Insufficient monthly surplus under synthetic rules.")
+        if "Insufficient monthly surplus under synthetic rules." not in notes:
+            notes.append("Insufficient monthly surplus under synthetic rules.")
 
     return EligibilityOutcome(
         max_loan=round(max_loan, 2),
@@ -333,10 +350,35 @@ def parse_message_into_borrower(
 # LLM Prompt (single function, role-aware)
 # ----------------------------
 
-AGENT_PROMPT = """
-You are part of a 3-agent housing assistant. Be concise, friendly, and action-oriented.
+# ----------------------------
+# Agent Backgrounds & Prompts
+# ----------------------------
 
-PHASE: {{$phase}}
+AGENT_BACKGROUNDS = {
+    "eligibility": """You are Deloitte’s EligibilityAgent.
+Background:
+- You DO NOT ask the user questions. Treat the USER content as a trigger only.
+- You only summarize what is already in SYSTEM FACTS (borrower fields + eligibility_outcome).
+- You never provide financial advice; you only summarize the synthetic calculator result.
+- End with a clear next step (e.g., "/next" to view listings).""",
+    "listings": """You are Deloitte’s ListingsAgent.
+Background:
+- You only show properties passed in SYSTEM FACTS under `current_listings`. Never invent rows.
+- Do NOT suggest changing filters or searching new suburbs. You can only use the details already provided via the form.
+- Allowed CTA: only “/pick <#>” (for area details). Never mention /book, /save, /search, /set, or “widen the search”.
+- Show 3–5 options, sorted sensibly, each with price, type, suburb and a short blurb. End with a single clear “/pick <#>” hint.""",
+    "area": """You are Deloitte’s AreaAgent.
+Background:
+- You show nearby Schools, PTV and Restaurants for the picked listing’s suburb (from `area_info`).
+- If the user asks for a category, show only that category; if none specified, show a concise mix.
+- If a requested category has no data, say so briefly and suggest another.""",
+}
+
+ELIGIBILITY_PROMPT = """
+ROLE: EligibilityAgent
+
+BACKGROUND:
+{{$background}}
 
 SYSTEM FACTS (JSON):
 {{$facts}}
@@ -348,16 +390,88 @@ USER:
 {{$user_input}}
 
 GUIDELINES:
-- For Eligibility phase: ask only for missing critical fields (first name, last name, income, debts, expenses, dependents, savings, target price, location). When sufficient, briefly summarize capacity and offer "/next" to see listings.
-- For Listings phase: **use ONLY the items provided in SYSTEM FACTS under `current_listings`. Never invent properties.** If `current_listings` is empty or missing, say "No matches in my dataset for the current filters" and suggest narrowing/widening filters (e.g., suburb, type, or budget). Present 3–5 options from `current_listings` as a numbered list with price, type, and suburb. Offer "/pick <#>" for area details.
-- For Area phase: If the user asks for specific categories (e.g., only PTV or only restaurants), show **only** those categories present in `area_info` / `requested_categories`. Do not include categories they did not ask for. If none were specified, give a concise mix across schools, PTV, and restaurants. If a requested category has no data, say so briefly.
-- Always end with one clear next action the user can take (e.g., "/next", "/pick 2", or provide a missing field).
+- DO NOT ask the user for any missing information. Ignore USER content beyond being a trigger to respond.
+- Rely only on SYSTEM FACTS. If `eligibility_outcome` is present, summarize clearly:
+  • Max borrowing capacity (A$)
+  • Estimated max monthly repayment (A$)
+  • Target price (A$) and savings/deposit (A$) if available
+  • LVR (%, if available) and whether LMI is required
+  • Any notable notes from `eligibility_outcome.notes`
+- If `eligibility_outcome` is missing, say: "I’m waiting for the eligibility form to be submitted." and explain the next step briefly.
+- Prompt-only policy overlays (demo purposes):
+    • If savings >= 1,000,000 → add a line: "Outcome: Cash-sufficient — loan not required. YOU ARE VERY RICH!".
+- End with one next action (e.g., "/next" to see listings).
+
+OUTPUT STYLE (strict)
+- Use exactly this compact 5–6 line card.
+- No extra sentences before/after.
+- Money: thousands separators, no cents (e.g., A$290,741). Repayments: add “/mo”.
+- Percent: 1 decimal (e.g., 81.3%).
+- Pull values from SYSTEM FACTS → eligibility_outcome and borrower fields.
+- If there are no notes, omit the Notes line.
+
+REPLY:
+"""
+
+LISTINGS_PROMPT = """
+ROLE: ListingsAgent
+
+BACKGROUND:
+{{$background}}
+
+SYSTEM FACTS (JSON):
+{{$facts}}
+
+RECENT MESSAGES:
+{{$history}}
+
+USER:
+{{$user_input}}
+
+GUIDELINES:
+- Use ONLY `current_listings` from SYSTEM FACTS. Never invent or infer properties. If empty, say so briefly.
+- Default output: show 3–5 options as a numbered list. For each item show exactly: A$<price> — <title> — <suburb>. Do NOT include bedrooms, bathrooms, car spaces, land size, or other specs unless the user explicitly asks or after they use /pick.
+- Provide one short, helpful blurb (1 sentence) based only on the title/location; do not infer amenities or specs.
+- Allowed CTA: only “/pick <#>”. Never mention /book, /save, /search, /set, or “widen the search”.
+- Do not ask the user to change suburbs/budget in chat. If they request changes, say: “I can only use the details you submitted. To change them, please /reset and refill the form.”
+- Keep the response concise and action-oriented. End with a single line prompt like: Choose one with /pick <#>.
+
+REPLY:
+"""
+
+AREA_PROMPT = """
+ROLE: AreaAgent
+
+BACKGROUND:
+{{$background}}
+
+SYSTEM FACTS (JSON):
+{{$facts}}
+
+RECENT MESSAGES:
+{{$history}}
+
+USER:
+{{$user_input}}
+
+GUIDELINES:
+- If the user asked for specific categories, show only those from `area_info` / `requested_categories`.
+- If none specified, show a concise mix from schools, PTV, and restaurants.
+- If a requested category is empty, mention it briefly and suggest another.
+- End with one clear next action (e.g., ask for a category or "/next" to finish).
 
 REPLY:
 """
 
 
-def build_prompt_config(service: str, service_id: str):
+def build_prompt_config(service: str, service_id: str, *, role: str):
+    template_map = {
+        "eligibility": ELIGIBILITY_PROMPT,
+        "listings": LISTINGS_PROMPT,
+        "area": AREA_PROMPT,
+    }
+    template = template_map[role]
+
     if service.lower() == "openai":
         exec_settings = OpenAIChatPromptExecutionSettings(
             service_id=service_id,
@@ -367,20 +481,22 @@ def build_prompt_config(service: str, service_id: str):
         exec_settings = AzureChatPromptExecutionSettings(
             service_id=service_id,
             ai_model_id=os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT_NAME", "gpt-35-turbo"),
-            max_completion_tokens=800,
             temperature=0.2,
+            max_completion_tokens=800,
         )
 
     return PromptTemplateConfig(
-        template=AGENT_PROMPT,
-        name="agent_reply",
+        template=template,
+        name=f"{role}_reply",
         template_format="semantic-kernel",
         input_variables=[
-            InputVariable(name="phase", description="current phase", is_required=True),
             InputVariable(name="facts", description="json facts", is_required=True),
             InputVariable(name="history", description="chat history", is_required=True),
             InputVariable(
                 name="user_input", description="user message", is_required=True
+            ),
+            InputVariable(
+                name="background", description="agent background", is_required=True
             ),
         ],
         execution_settings=exec_settings,
@@ -415,6 +531,20 @@ class Session:
         base["picked_listing"] = self.picked_listing
         if self.last_outcome:
             base["eligibility_outcome"] = asdict(self.last_outcome)
+
+        def _f(x):
+            try:
+                return float(x)
+            except Exception:
+                return None
+
+        s = _f(base.get("savings"))
+        tp = _f(base.get("target_price"))
+        cash_sufficient = bool(
+            (s is not None) and (s >= 1_000_000 or (tp is not None and s >= tp))
+        )
+        base["policy_overlays"] = {"cash_sufficient": cash_sufficient}
+
         return base
 
 
@@ -441,12 +571,13 @@ async def run_cli() -> None:
     service_id = cfg.add_service_to_kernel(kernel)
 
     # Add a single role-aware function
-    prompt_cfg = build_prompt_config(cfg.service, service_id)
-    agent_func = kernel.add_function(
-        function_name="reply",
-        plugin_name="agent",
-        prompt_template_config=prompt_cfg,
-    )
+    elig_cfg = build_prompt_config(cfg.service, service_id, role="eligibility")
+    list_cfg = build_prompt_config(cfg.service, service_id, role="listings")
+    area_cfg = build_prompt_config(cfg.service, service_id, role="area")
+
+    elig_func = kernel.add_function("reply", "eligibility_agent", elig_cfg)
+    list_func = kernel.add_function("reply", "listings_agent", list_cfg)
+    area_func = kernel.add_function("reply", "area_agent", area_cfg)
 
     chat = ChatHistory()
     sess = Session()
@@ -570,14 +701,28 @@ async def run_cli() -> None:
         chat.add_user_message(user)
         hist = human_readable_history(chat)
 
+        # Choose agent by phase
+        if sess.phase == Phase.ELIG:
+            func = elig_func
+            background = AGENT_BACKGROUNDS["eligibility"]
+        elif sess.phase == Phase.LIST:
+            func = list_func
+            background = AGENT_BACKGROUNDS["listings"]
+        elif sess.phase == Phase.AREA:
+            func = area_func
+            background = AGENT_BACKGROUNDS["area"]
+        else:
+            func = elig_func
+            background = AGENT_BACKGROUNDS["eligibility"]
+
         # Ask the agent LLM to reply
         reply = await kernel.invoke(
-            agent_func,
+            func,
             KernelArguments(
-                phase=sess.phase,
                 facts=json.dumps(facts, ensure_ascii=False),
                 history=hist,
                 user_input=user,
+                background=background,
             ),
         )
         reply_text = str(reply)
@@ -593,19 +738,36 @@ async def run_cli() -> None:
             sess.phase = Phase.LIST
 
 
-def current_listings(sess: Session) -> List[Dict[str, Any]]:
-    max_budget = sess.borrower.target_price or (
-        sess.last_outcome.max_loan if sess.last_outcome else None
-    )
+def current_listings(sess, *, max_rows=8):
+    rows = list(PROPERTIES)
 
-    suburb = None
-    if sess.borrower.location_hint:
-        suburb = resolve_suburb_key(sess.borrower.location_hint)
+    loc = (sess.borrower.location_hint or "").strip().lower()
+    if loc:
+        by_loc = [r for r in rows if (r.get("suburb") or "").strip().lower() == loc]
+        rows = by_loc or rows
 
-    # ⬇️ city=None so it won't filter out CE rows with blank city
-    return filter_properties(
-        max_budget, city=None, suburb=suburb, ptype=sess.preferred_type
-    )
+    # Optional type filter (leave as-is if you don't use it)
+    if sess.preferred_type:
+        t = sess.preferred_type.strip().lower()
+        rows = [r for r in rows if (r.get("type") or "").strip().lower() == t] or rows
+
+    cap = float(sess.borrower.target_price or 0)
+
+    def price(r):
+        return float(r.get("price") or 0)
+
+    NEAR_BAND = 0.25  # 25% instead of 10%
+    OVER_TAKE = 2  # take up to 2 closest over-budget items
+
+    if cap:
+        under = sorted([r for r in rows if price(r) <= cap], key=price)
+        over = sorted([r for r in rows if price(r) > cap], key=lambda r: price(r) - cap)
+        near = [r for r in over if price(r) <= cap * (1 + NEAR_BAND)]
+        rows = (under + near[:OVER_TAKE])[:max_rows]
+    else:
+        rows.sort(key=price)
+
+    return rows
 
 
 if __name__ == "__main__":

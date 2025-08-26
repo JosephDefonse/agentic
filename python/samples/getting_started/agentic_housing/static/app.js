@@ -85,6 +85,7 @@ async function sendText(text, { overrideLock = false } = {}) {
     } else {
       if (data.phaseClass) currentPhase = data.phaseClass;
       addBotMessage(data.reply, data.phaseClass);
+      console.debug(`[${data.phaseClass}] facts`, data.facts);
       // unlock only once we reach Listings
       enforceComposerLockByPhase();
     }
@@ -385,11 +386,11 @@ function renderEligibilityForm() {
 
     // 2) Auto-send a canonical message so the bot computes eligibility
     // Mark profile complete but stay in Eligibility
-    profileComplete = true;
-    currentPhase = "eligibility";
-    enforceComposerLockByPhase(); // this will now UNLOCK the chat box
+    // profileComplete = true;
+    // currentPhase = "eligibility";
+    // enforceComposerLockByPhase(); // this will now UNLOCK the chat box
 
-    lockEligibilityForm();
+    // lockEligibilityForm();
 
     // 3) Auto-send a single, canonical "My details are:" message so the Eligibility agent
     //    parses everything deterministically (includes "in <suburb>" to hit the suburb regex)
@@ -403,7 +404,54 @@ function renderEligibilityForm() {
         target
       )} in ${suburb}. Dependents ${deps}.`;
 
-    await sendText(detailsMsg, { overrideLock: true });
+    // 2) Persist to session and compute eligibility on the server
+    try {
+      const headers = {
+        "Content-Type": "application/json",
+        Accept: "application/json",
+      };
+      const t = getToken();
+      if (t) headers["Authorization"] = `Bearer ${t}`;
+
+      const seedBody = {
+        first_name: firstname,
+        last_name: lastname,
+        location_hint: suburb,
+        target_price: target,
+        gross_annual_income: income,
+        monthly_debts: debts,
+        monthly_expenses: expenses,
+        savings: savings,
+        dependents: deps,
+      };
+      const seedRes = await fetch("/api/session/seed", {
+        method: "POST",
+        headers,
+        body: JSON.stringify(seedBody),
+      });
+      const seedJson = await seedRes.json().catch(() => ({}));
+      await sendText(detailsMsg, { overrideLock: true });
+      if (!seedRes.ok || !seedJson.ok) {
+        eligStatus.textContent = seedJson.error || "Could not save session.";
+        return;
+      }
+    } catch (e) {
+      eligStatus.textContent = "Network error saving session.";
+      return;
+    }
+
+    // 3) Lock the form and move on automatically
+    profileComplete = true;
+    lockEligibilityForm();
+    currentPhase = "eligibility"; // we’re still in ELIG on the server
+    enforceComposerLockByPhase(); // unlock composer now
+
+    // Auto-advance to Listings
+    const data = await sendText("/next", { overrideLock: true });
+    if (data?.phaseClass === "listings") {
+      currentPhase = "listings";
+      unlockComposer();
+    }
 
     // Offer both options: user can type /next OR click a button
     //     const actionBar = document.createElement("div");

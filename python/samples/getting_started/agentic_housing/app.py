@@ -14,6 +14,7 @@ from semantic_kernel.functions import KernelArguments
 import logging
 import requests
 import sys
+import json
 
 # ---- Dynamic import of your existing SK script (works even with hyphen in filename)
 AGENT_FILE = os.environ.get("AGENT_FILE", "main.py")
@@ -30,10 +31,11 @@ Borrower = agentic_core.Borrower
 EligibilityOutcome = agentic_core.EligibilityOutcome
 Session = agentic_core.Session
 Phase = agentic_core.Phase
-parse_message_into_borrower = agentic_core.parse_message_into_borrower
+# parse_message_into_borrower = agentic_core.parse_message_into_borrower
 compute_eligibility = agentic_core.compute_eligibility
 current_listings = agentic_core.current_listings
 AREA_INFO = agentic_core.AREA_INFO
+AGENT_BACKGROUNDS = agentic_core.AGENT_BACKGROUNDS
 Config = agentic_core.Config
 build_prompt_config = agentic_core.build_prompt_config
 
@@ -166,7 +168,7 @@ def dataverse_get_properties(access_token: str, top: int = 5) -> dict:
     url = (
         f"{WEBAPIURL}cr54b_properties"
         f"?$select=cr54b_title,cr54b_price,cr54b_type,cr54b_city,cr54b_suburb,cr54b_state,"
-        f"cr54b_bed,cr54b_bath,cr54b_car,cr54b_propertyid&$top={top}"
+        f"cr54b_description,cr54b_bed,cr54b_bath,cr54b_car,cr54b_propertyid&$top={top}"
     )
     headers = {
         "Authorization": f"Bearer {access_token}",
@@ -242,6 +244,9 @@ def _map_properties(props_json: dict) -> list[dict]:
                 or it.get("id")
                 or it.get("cr54b_title"),
                 "title": (it.get("cr54b_title") or "").strip(),
+                "description": (
+                    it.get("cr54b_description") or it.get("description") or ""
+                ).strip(),
                 "price": it.get("cr54b_price") or 0,
                 "type": _normalize_type(it.get("cr54b_type") or ""),
                 "city": (it.get("cr54b_city") or "").strip(),
@@ -483,12 +488,30 @@ class WebAgent:
         cfg = Config()
         self.kernel = Kernel()
         self.service_id = cfg.add_service_to_kernel(self.kernel)
-        prompt_cfg = build_prompt_config(cfg.service, self.service_id)
-        self.agent_func = self.kernel.add_function(
-            function_name="reply",
-            plugin_name="agent",
-            prompt_template_config=prompt_cfg,
-        )
+
+        self.agent_funcs = {
+            "eligibility": self.kernel.add_function(
+                function_name="reply",
+                plugin_name="eligibility_agent",
+                prompt_template_config=build_prompt_config(
+                    cfg.service, self.service_id, role="eligibility"
+                ),
+            ),
+            "listings": self.kernel.add_function(
+                function_name="reply",
+                plugin_name="listings_agent",
+                prompt_template_config=build_prompt_config(
+                    cfg.service, self.service_id, role="listings"
+                ),
+            ),
+            "area": self.kernel.add_function(
+                function_name="reply",
+                plugin_name="area_agent",
+                prompt_template_config=build_prompt_config(
+                    cfg.service, self.service_id, role="area"
+                ),
+            ),
+        }
         self.chat = ChatHistory()
         self.sess = Session()
 
@@ -504,6 +527,13 @@ class WebAgent:
 
     def _build_facts(self) -> Dict[str, Any]:
         facts = self.sess.facts()
+
+        # Include the computed eligibility outcome so the prompt can summarize without asking
+        if self.sess.last_outcome is not None:
+            facts["eligibility_outcome"] = asdict(self.sess.last_outcome)
+        else:
+            facts["eligibility_outcome"] = None
+
         # listings snapshot (used by the LLM prompt too)
         if self.sess.phase in (Phase.LIST, Phase.AREA):
             lst = current_listings(self.sess)
@@ -515,6 +545,12 @@ class WebAgent:
                     "price": r["price"],
                     "type": r["type"],
                     "suburb": r["suburb"],
+                    "city": r["city"],
+                    "state": r["state"],
+                    "bed": r["bed"],
+                    "bath": r["bath"],
+                    "car": r["car"],
+                    "description": r["description"],
                 }
                 for i, r in enumerate(lst)
             ]
@@ -546,7 +582,7 @@ class WebAgent:
         if t == "/next":
             if self.sess.phase == Phase.ELIG:
                 self.sess.phase = Phase.LIST
-                return "Moving to Listings Agent. Ask me anything about the houses in Melbourne!"
+                return "Moving to Listings Agent. Ask me anything about the houses in the Suburb you have submitted!"
             elif self.sess.phase == Phase.LIST:
                 if self.sess.picked_listing is not None:
                     self.sess.phase = Phase.AREA
@@ -611,25 +647,39 @@ class WebAgent:
                 "facts": self._build_facts(),
             }
 
-        self.sess.borrower, updates = parse_message_into_borrower(
-            text, self.sess.borrower
-        )
-        if "preferred_type" in updates:
-            self.sess.preferred_type = updates.get("preferred_type")
+        # self.sess.borrower, updates = parse_message_into_borrower(
+        #     text, self.sess.borrower
+        # )
+        # if "preferred_type" in updates:
+        #     self.sess.preferred_type = updates.get("preferred_type")
 
-        self._maybe_compute_eligibility()
+        # self._maybe_compute_eligibility()
 
         self.chat.add_user_message(text)
         hist = self._history_str(self.chat)
 
+        phase = self.sess.phase
+        if phase not in self.agent_funcs:
+            phase = "eligibility"  # default fallback
+
+        func = self.agent_funcs[phase]
+        background = AGENT_BACKGROUNDS.get(phase, "")
+
         facts = self._build_facts()
+
+        app.logger.info(
+            "AGENT[%s] FACTS:\n%s",
+            phase,
+            json.dumps(facts, indent=2, ensure_ascii=False),
+        )
+
         result = await self.kernel.invoke(
-            self.agent_func,
+            func,
             KernelArguments(
-                phase=self.sess.phase,
                 facts=__import__("json").dumps(facts, ensure_ascii=False),
                 history=hist,
                 user_input=text,
+                background=background,
             ),
         )
         reply_text = str(result)
@@ -731,7 +781,10 @@ def api_session_seed():
         b.dependents = _int(data.get("dependents"), "dependents")
 
         # compute eligibility now that we have everything
-        agent._maybe_compute_eligibility()
+        # agent._maybe_compute_eligibility()
+
+        # We have all fields → compute deterministically now
+        agent.sess.last_outcome = compute_eligibility(b)
 
         return jsonify(
             {

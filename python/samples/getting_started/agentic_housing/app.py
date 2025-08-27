@@ -5,6 +5,7 @@ import importlib.util
 from dataclasses import asdict
 from typing import Dict, Any
 from collections import defaultdict
+from typing import Any
 
 from flask import Flask, render_template, request, jsonify, session as flask_session
 from semantic_kernel import Kernel
@@ -61,6 +62,65 @@ BEARER = ""
 # Option B: proper client-credentials flow (recommended)
 TENANT_ID = "common"
 CLIENT_ID = "51f81489-12ee-4a9e-aaaa-a2591f4598ab"
+
+from flask import session as flask_session
+
+
+def _ensure_dv_seeded():
+    import agentic_core as ac
+
+    # Only seed if missing in this worker
+    if not ac.PROPERTIES:
+        try:
+            token = _pick_bearer_from_request_or_default()
+            refresh_dataverse_into_agent(
+                top_props=50, top_support=100, access_token=token
+            )
+            app.logger.info("Seeded CE data in this worker.")
+        except Exception as e:
+            app.logger.warning("CE seed skipped/failed: %s", e)
+
+
+def _serialize_session(sess: Session) -> dict:
+    from dataclasses import asdict
+
+    payload = {
+        "phase": sess.phase,
+        "picked_listing": sess.picked_listing,
+        "preferred_type": sess.preferred_type,
+        "borrower": asdict(sess.borrower),
+        "last_outcome": asdict(sess.last_outcome) if sess.last_outcome else None,
+    }
+    return payload
+
+
+def _hydrate_session(sess: Session, data: dict | None) -> Session:
+    if not data:
+        return sess
+    try:
+        sess.phase = data.get("phase", sess.phase)
+        sess.picked_listing = data.get("picked_listing", sess.picked_listing)
+        sess.preferred_type = data.get("preferred_type", sess.preferred_type)
+
+        b = data.get("borrower") or {}
+        for k, v in b.items():
+            if hasattr(sess.borrower, k):
+                setattr(sess.borrower, k, v)
+
+        lo = data.get("last_outcome")
+        if lo:
+            sess.last_outcome = EligibilityOutcome(**lo)
+        else:
+            sess.last_outcome = None
+    except Exception:
+        # bad/mismatched cookie → start fresh quietly
+        pass
+    return sess
+
+
+def _persist_agent(agent: "WebAgent"):
+    flask_session["agent_state"] = _serialize_session(agent.sess)
+    flask_session.modified = True
 
 
 def _token_endpoint(tenant: str) -> str:
@@ -208,7 +268,7 @@ def dataverse_get_restaurants(access_token: str, top: int = 5) -> dict:
 
 
 def dataverse_get_schools(access_token: str, top: int = 5) -> dict:
-    url = f"{WEBAPIURL}cr54b_schools?$select=cr54b_name,cr54b_suburb&$top={top}"
+    url = f"{WEBAPIURL}cr54b_schools?$select=cr54b_name,cr54b_suburb,cr54b_rating&$top={top}"
     headers = {
         "Authorization": f"Bearer {access_token}",
         "Accept": "application/json",
@@ -269,7 +329,7 @@ def _map_area_info(
     property_rows: list[dict],
 ) -> dict:
     area: dict[str, dict[str, list[str]]] = defaultdict(
-        lambda: {"schools": [], "ptv": [], "restaurants": []}
+        lambda: {"schools": [], "ptv": [], "restaurants": [], "school_ratings": {}}
     )
 
     # seed keys from properties so AREA_INFO has entries for all suburbs with listings
@@ -285,8 +345,12 @@ def _map_area_info(
     for it in schools_json.get("value", []):
         suburb = _key_suburb(it.get("cr54b_suburb"))
         name = (it.get("cr54b_name") or "").strip()
-        if suburb and name and name not in area[suburb]["schools"]:
-            area[suburb]["schools"].append(name)
+        rating = it.get("cr54b_rating")
+        if suburb and name:
+            if name not in area[suburb]["schools"]:
+                area[suburb]["schools"].append(name)
+            if rating not in (None, ""):
+                area[suburb]["school_ratings"][name] = rating
 
     for it in restaurants_json.get("value", []):
         suburb = _key_suburb(it.get("cr54b_suburb"))
@@ -347,6 +411,7 @@ def _pick_bearer_from_request_or_default() -> str:
 
 @app.post("/api/dynamics/contacts")
 def api_create_contact():
+    _ensure_dv_seeded()
     data = request.get_json(force=True) or {}
 
     firstname = (data.get("firstname") or data.get("first_name") or "").strip()
@@ -399,6 +464,7 @@ def api_create_contact():
 
 @app.get("/api/dynamics/properties")
 def api_dynamics_properties():
+    _ensure_dv_seeded()
     try:
         top = int(request.args.get("top", 5))
     except ValueError:
@@ -414,6 +480,7 @@ def api_dynamics_properties():
 
 @app.get("/api/dynamics/ptv")
 def api_dynamics_ptv():
+    _ensure_dv_seeded()
     try:
         top = int(request.args.get("top", 5))
     except ValueError:
@@ -429,6 +496,7 @@ def api_dynamics_ptv():
 
 @app.get("/api/dynamics/restaurants")
 def api_dynamics_restaurants():
+    _ensure_dv_seeded()
     try:
         top = int(request.args.get("top", 5))
     except ValueError:
@@ -444,6 +512,7 @@ def api_dynamics_restaurants():
 
 @app.get("/api/dynamics/schools")
 def api_dynamics_schools():
+    _ensure_dv_seeded()
     try:
         top = int(request.args.get("top", 5))
     except ValueError:
@@ -459,6 +528,7 @@ def api_dynamics_schools():
 
 @app.post("/api/dynamics/sync")
 def api_dynamics_sync():
+    _ensure_dv_seeded()
     try:
         props = int(request.args.get("props", 50))
     except ValueError:
@@ -701,17 +771,16 @@ class WebAgent:
 
 
 def get_webagent() -> WebAgent:
-    sid = flask_session.get("sid")
-    if not sid:
-        sid = secrets.token_hex(8)
-        flask_session["sid"] = sid
-    if sid not in _sessions:
-        _sessions[sid] = {"agent": WebAgent()}
-    return _sessions[sid]["agent"]
+    # Always create a fresh instance, then hydrate its Session from the cookie.
+    agent = WebAgent()
+    saved = flask_session.get("agent_state")
+    _hydrate_session(agent.sess, saved)
+    return agent
 
 
 @app.route("/")
 def index():
+    _ensure_dv_seeded()
     # One-time CE → agent data sync on first page load (simple guard flag; no Flask hooks needed)
     if not app.config.get("_DV_AGENT_SYNCED"):
         try:
@@ -728,12 +797,14 @@ def index():
 
 @app.post("/api/message")
 def api_message():
+    _ensure_dv_seeded()
     data = request.get_json(force=True)
     user_text = (data or {}).get("message", "").strip()
     if not user_text:
         return jsonify({"error": "empty"}), 400
     agent = get_webagent()
     payload = asyncio.run(agent.send_async(user_text))
+    _persist_agent(agent)  # <-- persist back to the cookie
     return jsonify(payload)
 
 
@@ -760,6 +831,7 @@ def api_session_seed():
       first_name, last_name, location_hint (suburb),
       target_price, gross_annual_income, monthly_debts, monthly_expenses, savings, dependents
     """
+    _ensure_dv_seeded()
     data = request.get_json(force=True) or {}
     try:
         agent = get_webagent()
@@ -786,6 +858,8 @@ def api_session_seed():
         # We have all fields → compute deterministically now
         agent.sess.last_outcome = compute_eligibility(b)
 
+        _persist_agent(agent)  # <-- persist
+
         return jsonify(
             {
                 "ok": True,
@@ -801,6 +875,7 @@ def api_session_seed():
 
 @app.get("/api/debug/datasets")
 def api_debug_datasets():
+    _ensure_dv_seeded()
     import agentic_core as ac
 
     return jsonify(

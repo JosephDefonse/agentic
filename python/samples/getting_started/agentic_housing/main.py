@@ -457,6 +457,10 @@ USER:
 GUIDELINES:
 - If the user asked for specific categories, show only those from `area_info` / `requested_categories`.
 - If none specified, show a concise mix from schools, PTV, and restaurants.
+- Schools display rules:
+  • Default: list only school names from `area_info.schools` (no ratings).
+  • If the user asks about quality/ratings (mentions words like "rating", "rank", "best", "top", "good", "score", "how good"), include the rating for each school using `area_info.school_ratings` when available.
+  • If a rating is missing and ratings were requested, add "(no rating available)" after the name.
 - If a requested category is empty, mention it briefly and suggest another.
 - End with one clear next action (e.g., ask for a category or "/next" to finish).
 
@@ -697,7 +701,7 @@ async def run_cli() -> None:
         if area_snippet:
             facts["area_info"] = area_snippet
 
-        # Compose short history for the LLM
+        # Create a short history for the LLM to understand
         chat.add_user_message(user)
         hist = human_readable_history(chat)
 
